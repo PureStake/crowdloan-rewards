@@ -74,17 +74,15 @@ pub mod weights;
 pub mod pallet {
 
 	use crate::weights::WeightInfo;
-	use cumulus_primitives_core::relay_chain;
 	use frame_support::traits::WithdrawReasons;
 	use frame_support::{
-		dispatch::fmt::Debug,
 		pallet_prelude::*,
 		traits::{Currency, ExistenceRequirement::AllowDeath},
 		PalletId,
 	};
 	use frame_system::pallet_prelude::*;
 	use sp_core::crypto::AccountId32;
-	use sp_runtime::traits::{AccountIdConversion, Saturating, Verify};
+	use sp_runtime::traits::{AccountIdConversion, AtLeast32BitUnsigned, BlockNumberProvider, Saturating, Verify};
 	use sp_runtime::{MultiSignature, Perbill};
 	use sp_std::vec::Vec;
 	use sp_std::vec;
@@ -99,7 +97,7 @@ pub mod pallet {
 
 	/// Configuration trait of this pallet.
 	#[pallet::config]
-	pub trait Config: cumulus_pallet_parachain_system::Config + frame_system::Config {
+	pub trait Config: frame_system::Config {
 		/// The overarching event type
 		type Event: From<Event<Self>> + IsType<<Self as frame_system::Config>::Event>;
 		/// Checker for the reward vec, is it initalized already?
@@ -114,17 +112,21 @@ pub mod pallet {
 		type MinimumReward: Get<BalanceOf<Self>>;
 		/// The currency in which the rewards will be paid (probably the parachain native currency)
 		type RewardCurrency: Currency<Self::AccountId>;
-		// TODO What trait bounds do I need here? I think concretely we would
-		// be using MultiSigner? Or maybe MultiAccount? I copied these from frame_system
 		/// The AccountId type contributors used on the relay chain.
 		type RelayChainAccountId: Parameter
-			+ Member
-			+ MaybeSerializeDeserialize
-			+ Ord
-			+ Default
-			+ Debug
+			//TODO these AccountId32 bounds feel a little extraneous. I wonder if we can remove them.
 			+ Into<AccountId32>
 			+ From<AccountId32>;
+		
+		/// The type that will be used to track vesting progress
+		type VestingBlockNumber: AtLeast32BitUnsigned
+		+ Parameter
+		+ Default
+		+ Into<BalanceOf<Self>>;
+
+		/// The notion of time that will be used for vesting. Probably
+		/// either the relay chain or sovereign chain block number.
+		type VestingBlockProvider: BlockNumberProvider<BlockNumber = Self::VestingBlockNumber>;
 
 		type WeightInfo: WeightInfo;
 	}
@@ -149,10 +151,7 @@ pub mod pallet {
 		fn on_finalize(n: <T as frame_system::Config>::BlockNumber) {
 			// In the first block of the parachain we need to introduce the relay block related info
 			if n == 1u32.into() {
-				let slot = cumulus_pallet_parachain_system::Pallet::<T>::validation_data()
-					.expect("validation data was set in parachain system inherent")
-					.relay_parent_number;
-				<InitRelayBlock<T>>::put(slot);
+				<InitVestingBlock<T>>::put(T::VestingBlockProvider::current_block_number());
 			}
 		}
 	}
@@ -259,21 +258,19 @@ pub mod pallet {
 				Error::<T>::RewardsAlreadyClaimed
 			);
 
-			// Vesting is done in relation with the relay chain slot
-			let now = cumulus_pallet_parachain_system::Pallet::<T>::validation_data()
-				.expect("validation data was set in parachain system inherent")
-				.relay_parent_number;
+			// Get the current block used for vesting purposes
+			let now = T::VestingBlockProvider::current_block_number();
 
 			// Substract the first payment from the vested amount
 			let first_paid = T::InitializationPayment::get() * info.total_reward;
 
 			// To calculate how much could the user have claimed already
-			let payable_period = now.saturating_sub(<InitRelayBlock<T>>::get());
+			let payable_period = now.saturating_sub(<InitVestingBlock<T>>::get());
 
 			// How much should the contributor have already claimed by this block?
 			// By multiplying first we allow the conversion to integer done with the biggest number
-			let period = EndRelayBlock::<T>::get() - InitRelayBlock::<T>::get();
-			let should_have_claimed = if period == 0 {
+			let period = EndVestingBlock::<T>::get() - InitVestingBlock::<T>::get();
+			let should_have_claimed = if period == 0u32.into() {
 				// Pallet is configured with a zero vesting period.
 				info.total_reward - first_paid
 			} else {
@@ -343,7 +340,7 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::complete_initialization())]
 		pub fn complete_initialization(
 			origin: OriginFor<T>,
-			lease_ending_block: relay_chain::BlockNumber,
+			lease_ending_block: T::VestingBlockNumber,
 		) -> DispatchResultWithPostInfo {
 			ensure_root(origin)?;
 
@@ -357,7 +354,7 @@ pub mod pallet {
 
 			// This ensures the lease ending block is bigger than the init relay block
 			ensure!(
-				lease_ending_block > InitRelayBlock::<T>::get(),
+				lease_ending_block > InitVestingBlock::<T>::get(),
 				Error::<T>::VestingPeriodNonValid
 			);
 
@@ -381,7 +378,7 @@ pub mod pallet {
 			.expect("Shouldnt fail, as the fund should be enough to burn and nothing is locked");
 			drop(imbalance);
 
-			EndRelayBlock::<T>::put(lease_ending_block);
+			EndVestingBlock::<T>::put(lease_ending_block);
 
 			<Initialized<T>>::put(true);
 
@@ -602,12 +599,12 @@ pub mod pallet {
 	#[pallet::storage]
 	#[pallet::getter(fn init_relay_block)]
 	/// Relay block height at the initialization of the pallet
-	type InitRelayBlock<T: Config> = StorageValue<_, relay_chain::BlockNumber, ValueQuery>;
+	type InitVestingBlock<T: Config> = StorageValue<_, T::VestingBlockNumber, ValueQuery>;
 
 	#[pallet::storage]
 	#[pallet::getter(fn end_relay_block)]
 	/// Relay block height at the initialization of the pallet
-	type EndRelayBlock<T: Config> = StorageValue<_, relay_chain::BlockNumber, ValueQuery>;
+	type EndVestingBlock<T: Config> = StorageValue<_, T::VestingBlockNumber, ValueQuery>;
 
 	#[pallet::storage]
 	#[pallet::getter(fn init_reward_amount)]
